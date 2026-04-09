@@ -41,9 +41,27 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     return DiffusionInt8Config(**kw)
 
 
+def _build_torchao(**kw: Any) -> QuantizationConfig:
+    """Build TorchAOConfig from a plain dict spec."""
+    from vllm.model_executor.layers.quantization.torchao import TorchAOConfig
+
+    torchao_quant_config = kw.pop("quantization_config", None)
+    if torchao_quant_config is None:
+        raise ValueError("TorchAO quantization config requires `quantization_config`.")
+    if not isinstance(torchao_quant_config, Mapping):
+        raise TypeError(
+            "`quantization_config` must be a dict-like object, "
+            f"got {type(torchao_quant_config).__name__}"
+        )
+    if kw:
+        raise TypeError(f"Unsupported TorchAO kwargs: {sorted(kw.keys())}")
+
+    return TorchAOConfig.from_config(torchao_quant_config)
+
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "gguf": _build_gguf,
     "int8": _build_int8,
+    "torchao": _build_torchao,
 }
 
 SUPPORTED_QUANTIZATION_METHODS: list[str] = list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))

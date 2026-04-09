@@ -53,8 +53,7 @@ class LayerwiseOffloadHook(ModelHook):
         # Backward link to the hook that is responsible for prefetching *this* block's weights
         self._prev_hook: LayerwiseOffloadHook | None = None
 
-        self.next_block_parameters: dict[str, nn.Parameter] = {}
-        self.next_block_buffers: dict[str, torch.Tensor] = {}
+        self.module: nn.Module | None = None
         self.dtype_cpu_flattened_weights: dict[torch.dtype, torch.Tensor] = {}
         self.dtype_metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
 
@@ -62,22 +61,101 @@ class LayerwiseOffloadHook(ModelHook):
         # This all happen during the hook instance being registered to hook registry;
         # the input module is kept intact
         module = super().initialize_hook(module)
+        self.module = module
 
-        self.block_parameters: dict[str, nn.Parameter] = dict(module.named_parameters())
-        self.block_buffers: dict[str, torch.Tensor] = dict(module.named_buffers())
-
-        self.next_block_parameters: dict[str, nn.Parameter] = dict(self.next_block.named_parameters())
-        self.next_block_buffers: dict[str, torch.Tensor] = dict(self.next_block.named_buffers())
+        next_block_parameters = dict(self.next_block.named_parameters())
+        next_block_buffers = dict(self.next_block.named_buffers())
 
         # Pre-allocate gpu tensors in a flattened way
         self.dtype_cpu_flattened_weights, self.dtype_metadata = LayerwiseOffloadHook._to_cpu(
-            self.next_block_parameters, self.next_block_buffers, self.device, self.pin_memory
+            self.next_block,
+            next_block_parameters,
+            next_block_buffers,
+            self.device,
+            self.pin_memory,
         )
-
         return module
 
     @staticmethod
+    def _get_named_params_and_bufs(module: nn.Module) -> tuple[dict[str, nn.Parameter], dict[str, torch.Tensor]]:
+        return dict(module.named_parameters()), dict(module.named_buffers())
+
+    @staticmethod
+    def _is_tensor_subclass_tensor(tensor: torch.Tensor) -> bool:
+        return hasattr(tensor, "__tensor_flatten__") and hasattr(type(tensor), "__tensor_unflatten__")
+
+    @staticmethod
+    def _is_materialized_tensor(tensor: torch.Tensor) -> bool:
+        if LayerwiseOffloadHook._is_tensor_subclass_tensor(tensor):
+            tensor_names, _ = tensor.__tensor_flatten__()
+            return any(
+                LayerwiseOffloadHook._is_materialized_tensor(getattr(tensor, inner_name)) for inner_name in tensor_names
+            )
+        return tensor.dim() > 0
+
+    @staticmethod
+    def _make_empty_tensor_subclass_like(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+        tensor_names, attrs = tensor.__tensor_flatten__()
+        tensor_data_dict: dict[str, torch.Tensor] = {}
+        for inner_name in tensor_names:
+            inner_tensor = getattr(tensor, inner_name)
+            tensor_data_dict[inner_name] = torch.empty((), device=device, dtype=inner_tensor.dtype)
+        return type(tensor).__tensor_unflatten__(tensor_data_dict, attrs, None, None)
+
+    @staticmethod
+    def _replace_named_param_or_buffer(
+        module: nn.Module,
+        params: dict[str, nn.Parameter],
+        bufs: dict[str, torch.Tensor],
+        name: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        owner_name, local_name = name.rsplit(".", 1) if "." in name else ("", name)
+        owner = module.get_submodule(owner_name) if owner_name else module
+
+        if name in params:
+            requires_grad = params[name].requires_grad
+            tensor = nn.Parameter(tensor, requires_grad=requires_grad)
+            owner._parameters[local_name] = tensor
+            params[name] = tensor
+            return
+
+        owner._buffers[local_name] = tensor
+        bufs[name] = tensor
+
+    @staticmethod
+    def _make_tensor_subclass_inner_key(name: str, inner_name: str) -> str:
+        return f"{name}::__tensor_inner__::{inner_name}"
+
+    @staticmethod
+    def _split_tensor_subclass_inner_key(name: str) -> tuple[str, str] | None:
+        separator = "::__tensor_inner__::"
+        if separator not in name:
+            return None
+        return name.split(separator, 1)  # type: ignore[return-value]
+
+    @staticmethod
+    def _get_tensor_storage_span(tensor: torch.Tensor) -> tuple[int, int]:
+        if tensor.numel() == 0:
+            return tensor.storage_offset(), 0
+
+        strides = tensor.stride()
+        if any(stride < 0 for stride in strides):
+            raise ValueError(
+                f"Negative stride tensor is not supported by layerwise offload: "
+                f"shape={tuple(tensor.shape)}, stride={tuple(strides)}"
+            )
+
+        storage_offset = tensor.storage_offset()
+        max_offset = storage_offset
+        for size, stride in zip(tensor.shape, strides):
+            max_offset += (size - 1) * stride
+
+        return storage_offset, max_offset - storage_offset + 1
+
+    @staticmethod
     def _to_cpu(
+        module: nn.Module,
         params: dict[str, nn.Parameter],
         bufs: dict[str, torch.Tensor],
         device: torch.device,
@@ -99,6 +177,24 @@ class LayerwiseOffloadHook(ModelHook):
         dtype_metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
 
         for name, param_or_buf in chain(params.items(), bufs.items()):
+            if LayerwiseOffloadHook._is_tensor_subclass_tensor(param_or_buf):
+                tensor_names, _ = param_or_buf.__tensor_flatten__()
+                for inner_name in tensor_names:
+                    inner_tensor = getattr(param_or_buf, inner_name)
+                    dtype = inner_tensor.dtype
+                    if dtype not in dtype_grouped_weights:
+                        dtype_grouped_weights[dtype] = {}
+                    combined_name = LayerwiseOffloadHook._make_tensor_subclass_inner_key(name, inner_name)
+                    dtype_grouped_weights[dtype][combined_name] = inner_tensor
+
+                LayerwiseOffloadHook._replace_named_param_or_buffer(
+                    module,
+                    params,
+                    bufs,
+                    name,
+                    LayerwiseOffloadHook._make_empty_tensor_subclass_like(param_or_buf, device),
+                )
+                continue
             dtype = param_or_buf.dtype
             if dtype not in dtype_grouped_weights:
                 dtype_grouped_weights[dtype] = {}
@@ -106,38 +202,42 @@ class LayerwiseOffloadHook(ModelHook):
 
         for dtype, name2weights in dtype_grouped_weights.items():
             # total # of parameters + buffers
-            total_numel = sum(t.numel() for _, t in name2weights.items())
+            total_numel = sum(LayerwiseOffloadHook._get_tensor_storage_span(t)[1] for _, t in name2weights.items())
             cpu_tensor = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=pin_memory)
 
             current_offset = 0
             for name, param_or_buf in name2weights.items():
-                numel = param_or_buf.numel()
-                cpu_tensor[current_offset : current_offset + numel].copy_(param_or_buf.flatten())
+                storage_offset, storage_numel = LayerwiseOffloadHook._get_tensor_storage_span(param_or_buf)
+                storage_view = param_or_buf.as_strided((storage_numel,), (1,), storage_offset)
+                cpu_tensor[current_offset : current_offset + storage_numel].copy_(storage_view)
                 if dtype not in dtype_metadata:
                     dtype_metadata[dtype] = []
                 dtype_metadata[dtype].append(
                     {
                         "name": name,
                         "offset": current_offset,
-                        "numel": numel,
-                        "shape": param_or_buf.shape,
+                        "storage_numel": storage_numel,
+                        "shape": tuple(param_or_buf.shape),
+                        "stride": tuple(param_or_buf.stride()),
                     }
                 )
 
                 param_or_buf.data = torch.empty((), device=device, dtype=dtype)
-                current_offset += numel
+                current_offset += storage_numel
 
             dtype_cpu_flattened_weights[dtype] = cpu_tensor
-
         return dtype_cpu_flattened_weights, dtype_metadata
 
     @property
     def is_materialized(self) -> bool:
         """Check whether this block's parameters hold real data on device."""
-        for param in self.block_parameters.values():
-            return param.data.dim() > 0
+        if self.module is None:
+            return True
 
-        return True
+        block_parameters, _ = self._get_named_params_and_bufs(self.module)
+        if not block_parameters:
+            return True
+        return any(self._is_materialized_tensor(param.data) for param in block_parameters.values())
 
     @torch.compiler.disable
     def prefetch_layer(self, non_blocking: bool = True) -> None:
@@ -147,9 +247,7 @@ class LayerwiseOffloadHook(ModelHook):
         with non_blocking set to True.
         """
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
-
-        layer_params = self.next_block_parameters
-        layer_bufs = self.next_block_buffers
+        layer_params, layer_bufs = self._get_named_params_and_bufs(self.next_block)
 
         evt = current_omni_platform.Event()
         gpu_weights: dict[torch.dtype, torch.Tensor] = {}
@@ -162,19 +260,47 @@ class LayerwiseOffloadHook(ModelHook):
 
             evt.record(self.copy_stream)
 
+        tensor_subclass_rebuilds: dict[str, dict[str, torch.Tensor]] = {}
         for dtype, ordered_metadata in self.dtype_metadata.items():
             # ordered_metadata: list[dict[str, Any]]
             gpu_weight = gpu_weights[dtype]
 
             for metadata in ordered_metadata:
                 target_name = metadata["name"]
-                target_param_or_buf = (
-                    layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
-                )
+                storage_view = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["storage_numel"]]
+                weight_view = storage_view.as_strided(metadata["shape"], metadata["stride"])
 
-                target_param_or_buf.data = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
-                    metadata["shape"]
-                )
+                if target_name in layer_params or target_name in layer_bufs:
+                    target_param_or_buf = (
+                        layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
+                    )
+                    target_param_or_buf.data = weight_view
+                    continue
+
+                split_name = LayerwiseOffloadHook._split_tensor_subclass_inner_key(target_name)
+                if split_name is None:
+                    raise KeyError(f"Unexpected weight name during prefetch: {target_name}")
+
+                outer_name, inner_name = split_name
+                tensor_subclass_rebuild = tensor_subclass_rebuilds.setdefault(outer_name, {})
+                tensor_subclass_rebuild[inner_name] = weight_view
+
+        for target_name, tensor_data_dict in tensor_subclass_rebuilds.items():
+            target_param_or_buf = layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
+            _, attrs = target_param_or_buf.__tensor_flatten__()
+            rebuilt_tensor = type(target_param_or_buf).__tensor_unflatten__(
+                tensor_data_dict,
+                attrs,
+                None,
+                None,
+            )
+            LayerwiseOffloadHook._replace_named_param_or_buffer(
+                self.next_block,
+                layer_params,
+                layer_bufs,
+                target_name,
+                rebuilt_tensor,
+            )
 
         self._prefetch_done = evt
 
@@ -190,10 +316,33 @@ class LayerwiseOffloadHook(ModelHook):
         self._prefetch_done = None
 
         # free GPU residency
-        for _, param in self.block_parameters.items():
-            param.data = torch.empty((), device=self.device, dtype=param.dtype)
-        for _, buf in self.block_buffers.items():
-            buf.data = torch.empty((), device=self.device, dtype=buf.dtype)
+        if self.module is None:
+            return
+        block_parameters, block_buffers = self._get_named_params_and_bufs(self.module)
+
+        for name, param in list(block_parameters.items()):
+            if LayerwiseOffloadHook._is_tensor_subclass_tensor(param):
+                LayerwiseOffloadHook._replace_named_param_or_buffer(
+                    self.module,
+                    block_parameters,
+                    block_buffers,
+                    name,
+                    LayerwiseOffloadHook._make_empty_tensor_subclass_like(param, self.device),
+                )
+            else:
+                param.data = torch.empty((), device=self.device, dtype=param.dtype)
+
+        for name, buf in list(block_buffers.items()):
+            if LayerwiseOffloadHook._is_tensor_subclass_tensor(buf):
+                LayerwiseOffloadHook._replace_named_param_or_buffer(
+                    self.module,
+                    block_parameters,
+                    block_buffers,
+                    name,
+                    LayerwiseOffloadHook._make_empty_tensor_subclass_like(buf, self.device),
+                )
+            else:
+                buf.data = torch.empty((), device=self.device, dtype=buf.dtype)
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         # if the previous hook was skipped and the weights are not on device,

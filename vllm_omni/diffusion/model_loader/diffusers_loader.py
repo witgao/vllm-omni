@@ -23,7 +23,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     maybe_download_from_modelscope,
+    multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
+    pt_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -186,21 +188,39 @@ class DiffusersPipelineLoader:
             and getattr(od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
         )
-        if use_multithread:
-            num_threads = getattr(od_config, "num_weight_load_threads", 4)
-            # Keep deterministic shard order before passing to vLLM helper.
-            sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
-            weights_iterator = multi_thread_safetensors_weights_iterator(
-                sorted_hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                max_workers=num_threads,
-            )
+        if use_safetensors:
+            if use_multithread:
+                num_threads = getattr(od_config, "num_weight_load_threads", 4)
+                # Keep deterministic shard order before passing to vLLM helper.
+                sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
+                weights_iterator = multi_thread_safetensors_weights_iterator(
+                    sorted_hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    max_workers=num_threads,
+                )
+            else:
+                weights_iterator = safetensors_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    self.load_config.safetensors_load_strategy,
+                )
         else:
-            weights_iterator = safetensors_weights_iterator(
-                hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                self.load_config.safetensors_load_strategy,
-            )
+            if use_multithread:
+                num_threads = getattr(od_config, "num_weight_load_threads", 4)
+                # Keep deterministic shard order before passing to vLLM helper.
+                sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
+                weights_iterator = multi_thread_pt_weights_iterator(
+                    sorted_hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    self.load_config.pt_load_map_location,
+                    max_workers=num_threads,
+                )
+            else:
+                weights_iterator = pt_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    self.load_config.pt_load_map_location,
+                )
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
@@ -329,7 +349,9 @@ class DiffusersPipelineLoader:
         if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             # NOTE: if the model is quantized, ignore not_loaded check for scale weights
-            weights_scale_not_loaded = {name for name in weights_not_loaded if name.endswith("weight_scale")}
+            weights_scale_not_loaded = {
+                name for name in weights_not_loaded if name.endswith("weight_scale") or name.endswith("input_scale_ub")
+            }
             weights_not_loaded = weights_not_loaded - weights_scale_not_loaded
             if weights_not_loaded:
                 raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")

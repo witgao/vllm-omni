@@ -33,6 +33,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import time
 from pathlib import Path
@@ -46,6 +47,29 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+
+
+def get_torchao_quant_config(model: str) -> dict[str, object]:
+    config_path = Path(model).expanduser() / "transformer" / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            "TorchAO quantization expects a local Diffusers model directory with "
+            f"`transformer/config.json`, but {config_path} does not exist."
+        )
+
+    with config_path.open("r", encoding="utf-8") as f:
+        transformer_config = json.load(f)
+
+    quantization_config = transformer_config.get("quantization_config")
+    if not isinstance(quantization_config, dict):
+        raise ValueError(
+            f"Missing dict `quantization_config` in {config_path}."
+        )
+
+    return {
+        "method": "torchao",
+        "quantization_config": dict(quantization_config),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -187,6 +211,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="Optional transformer quantization method, e.g. fp8, fbgemm_fp8, int8, or torchao.",
+    )
+    parser.add_argument(
+        "--is-checkpoint-fp8-serialized",
+        action="store_true",
+        help="Treat checkpoint as pre-serialized FP8 weights with weight_scale tensors.",
+    )
     return parser.parse_args()
 
 
@@ -269,6 +304,22 @@ def main():
 
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    quantization_config = None
+    if args.quantization is not None:
+        if args.quantization == "torchao":
+            quantization_config = get_torchao_quant_config(args.model)
+        elif args.quantization == "fp8":
+            quantization_config = {
+                "method": "fp8",
+                "is_checkpoint_fp8_serialized": args.is_checkpoint_fp8_serialized,
+            }
+        elif args.quantization == "fbgemm_fp8":
+            quantization_config = {
+                "method": "fbgemm_fp8",
+                "ignore_list": [],
+                "input_scale_ub": 1200.0,
+            }
+
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
@@ -292,6 +343,7 @@ def main():
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        quantization_config=quantization_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
@@ -303,6 +355,8 @@ def main():
     print(f"\n{'=' * 60}")
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
+    if quantization_config is not None:
+        print(f"  Quantization: {quantization_config}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
     print(

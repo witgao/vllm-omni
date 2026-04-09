@@ -8,8 +8,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.attention import FeedForward
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
+from diffusers.models.activations import FP32SiLU, get_activation
+from diffusers.models.embeddings import Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
 from vllm.distributed import (
@@ -19,7 +19,13 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -31,6 +37,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
+
+
+def _append_prefix(prefix: str, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
 
 
 def apply_rotary_emb_wan(
@@ -94,7 +104,16 @@ class DistributedRMSNorm(nn.Module):
 class ColumnParallelGELU(nn.Module):
     """Column parallel linear with GELU activation."""
 
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str = "tanh", bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        *,
+        approximate: str = "tanh",
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -102,6 +121,8 @@ class ColumnParallelGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "proj"),
         )
         self.approximate = approximate
 
@@ -119,15 +140,26 @@ class WanFeedForward(nn.Module):
     def __init__(
         self,
         dim: int,
-        inner_dim: int,
         dim_out: int | None = None,
+        mult: int = 4,
+        inner_dim: int | None = None,
         bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
+        inner_dim = inner_dim or int(dim * mult)
         dim_out = dim_out or dim
 
         # ColumnParallel: scatter to each tp_rank
-        self.net_0 = ColumnParallelGELU(dim, inner_dim, approximate="tanh", bias=bias)
+        self.net_0 = ColumnParallelGELU(
+            dim,
+            inner_dim,
+            approximate="tanh",
+            bias=bias,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "net_0"),
+        )
         # Placeholder for weight loading compatibility
         self.net_1 = nn.Identity()
         # RowParallel: gather from each tp_rank
@@ -137,6 +169,8 @@ class WanFeedForward(nn.Module):
             bias=bias,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "net_2"),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -227,11 +261,24 @@ class WanRotaryPosEmbed(nn.Module):
 class WanImageEmbedding(nn.Module):
     """Image embedding module for I2V tasks."""
 
-    def __init__(self, in_features: int, out_features: int, pos_embed_seq_len: int | None = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        pos_embed_seq_len: int | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
 
         self.norm1 = FP32LayerNorm(in_features)
-        self.ff = FeedForward(in_features, out_features, mult=1, activation_fn="gelu")
+        self.ff = WanFeedForward(
+            in_features,
+            out_features,
+            mult=1,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "ff"),
+        )
         self.norm2 = FP32LayerNorm(out_features)
         if pos_embed_seq_len is not None:
             self.pos_embed = nn.Parameter(torch.zeros(1, pos_embed_seq_len, in_features))
@@ -250,6 +297,118 @@ class WanImageEmbedding(nn.Module):
         return hidden_states
 
 
+class WanTimestepEmbedding(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        time_embed_dim: int,
+        act_fn: str = "silu",
+        out_dim: int | None = None,
+        post_act_fn: str | None = None,
+        cond_proj_dim: int | None = None,
+        sample_proj_bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+
+        self.linear_1 = ReplicatedLinear(
+            in_channels,
+            time_embed_dim,
+            bias=sample_proj_bias,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "linear_1"),
+        )
+
+        if cond_proj_dim is not None:
+            self.cond_proj = ReplicatedLinear(
+                cond_proj_dim,
+                in_channels,
+                bias=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=_append_prefix(prefix, "cond_proj"),
+            )
+        else:
+            self.cond_proj = None
+
+        self.act = get_activation(act_fn)
+
+        time_embed_dim_out = out_dim if out_dim is not None else time_embed_dim
+        self.linear_2 = ReplicatedLinear(
+            time_embed_dim,
+            time_embed_dim_out,
+            bias=sample_proj_bias,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "linear_2"),
+        )
+
+        self.post_act = None if post_act_fn is None else get_activation(post_act_fn)
+
+    def forward(self, sample: torch.Tensor, condition: torch.Tensor | None = None) -> torch.Tensor:
+        if condition is not None:
+            sample = sample + self.cond_proj(condition)
+        sample = self.linear_1(sample)
+
+        if self.act is not None:
+            sample = self.act(sample)
+
+        sample = self.linear_2(sample)
+
+        if self.post_act is not None:
+            sample = self.post_act(sample)
+        return sample
+
+
+class WanPixArtAlphaTextProjection(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_size: int,
+        out_features: int | None = None,
+        act_fn: str = "gelu_tanh",
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        out_features = hidden_size if out_features is None else out_features
+
+        self.linear_1 = ReplicatedLinear(
+            in_features,
+            hidden_size,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "linear_1"),
+        )
+
+        if act_fn == "gelu_tanh":
+            self.act_1 = nn.GELU(approximate="tanh")
+        elif act_fn == "silu":
+            self.act_1 = nn.SiLU()
+        elif act_fn == "silu_fp32":
+            self.act_1 = FP32SiLU()
+        else:
+            raise ValueError(f"Unknown activation function: {act_fn}")
+
+        self.linear_2 = ReplicatedLinear(
+            hidden_size,
+            out_features,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "linear_2"),
+        )
+
+    def forward(self, caption: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.linear_1(caption)
+        hidden_states = self.act_1(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+
+
 class WanTimeTextImageEmbedding(nn.Module):
     """Combined time, text, and image condition embeddings."""
 
@@ -261,18 +420,44 @@ class WanTimeTextImageEmbedding(nn.Module):
         text_embed_dim: int,
         image_embed_dim: int | None = None,
         pos_embed_seq_len: int | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
         self.timesteps_proj = Timesteps(num_channels=time_freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0)
-        self.time_embedder = TimestepEmbedding(in_channels=time_freq_dim, time_embed_dim=dim)
+        self.time_embedder = WanTimestepEmbedding(
+            in_channels=time_freq_dim,
+            time_embed_dim=dim,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "time_embedder"),
+        )
         self.act_fn = nn.SiLU()
-        self.time_proj = nn.Linear(dim, time_proj_dim)
-        self.text_embedder = PixArtAlphaTextProjection(text_embed_dim, dim, act_fn="gelu_tanh")
+        self.time_proj = ReplicatedLinear(
+            dim,
+            time_proj_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "time_proj"),
+        )
+        self.text_embedder = WanPixArtAlphaTextProjection(
+            in_features=text_embed_dim,
+            hidden_size=dim,
+            act_fn="gelu_tanh",
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "text_embedder"),
+        )
 
         self.image_embedder = None
         if image_embed_dim is not None:
-            self.image_embedder = WanImageEmbedding(image_embed_dim, dim, pos_embed_seq_len=pos_embed_seq_len)
+            self.image_embedder = WanImageEmbedding(
+                image_embed_dim,
+                dim,
+                pos_embed_seq_len=pos_embed_seq_len,
+                quant_config=quant_config,
+                prefix=_append_prefix(prefix, "image_embedder"),
+            )
 
     def forward(
         self,
@@ -286,7 +471,9 @@ class WanTimeTextImageEmbedding(nn.Module):
             timestep = timestep.unflatten(0, (-1, timestep_seq_len))
 
         time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
-        if timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
+        if timestep.dtype != time_embedder_dtype and (
+            time_embedder_dtype != torch.int8 and time_embedder_dtype != torch.float8_e4m3fn
+        ):
             timestep = timestep.to(time_embedder_dtype)
         temb = self.time_embedder(timestep).type_as(encoder_hidden_states)
         timestep_proj = self.time_proj(self.act_fn(temb))
@@ -351,6 +538,8 @@ class WanSelfAttention(nn.Module):
         head_dim: int,
         eps: float = 1e-5,
         dropout: float = 0.0,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -365,6 +554,8 @@ class WanSelfAttention(nn.Module):
             head_size=head_dim,
             total_num_heads=num_heads,
             bias=True,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "to_qkv"),
         )
 
         self.num_heads = self.to_qkv.num_heads
@@ -381,6 +572,8 @@ class WanSelfAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "to_out"),
         )
         self.dropout = nn.Dropout(dropout)
 
@@ -452,6 +645,8 @@ class WanCrossAttention(nn.Module):
         eps: float = 1e-5,
         dropout: float = 0.0,
         added_kv_proj_dim: int | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -468,6 +663,8 @@ class WanCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "to_q"),
         )
 
         # Separate K and V projections for cross-attention
@@ -477,6 +674,8 @@ class WanCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "to_k"),
         )
 
         self.to_v = ColumnParallelLinear(
@@ -485,6 +684,8 @@ class WanCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "to_v"),
         )
 
         tp_size = get_tensor_model_parallel_world_size()
@@ -504,6 +705,8 @@ class WanCrossAttention(nn.Module):
                 bias=True,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=_append_prefix(prefix, "add_k_proj"),
             )
             self.add_v_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
@@ -511,6 +714,8 @@ class WanCrossAttention(nn.Module):
                 bias=True,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=_append_prefix(prefix, "add_v_proj"),
             )
             self.norm_added_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
         else:
@@ -525,6 +730,8 @@ class WanCrossAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "to_out"),
         )
         self.dropout = nn.Dropout(dropout)
 
@@ -608,6 +815,8 @@ class WanTransformerBlock(nn.Module):
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -620,6 +829,8 @@ class WanTransformerBlock(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
             eps=eps,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "attn1"),
         )
 
         # 2. Cross-attention
@@ -629,11 +840,19 @@ class WanTransformerBlock(nn.Module):
             head_dim=head_dim,
             eps=eps,
             added_kv_proj_dim=added_kv_proj_dim,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "attn2"),
         )
         self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
         # 3. Feed-forward
-        self.ffn = WanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
+        self.ffn = WanFeedForward(
+            dim=dim,
+            inner_dim=ffn_dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "ffn"),
+        )
         self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
 
         # Scale-shift table for modulation
@@ -791,6 +1010,8 @@ class WanTransformer3DModel(nn.Module):
         added_kv_proj_dim: int | None = None,
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: int | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -837,19 +1058,37 @@ class WanTransformer3DModel(nn.Module):
             text_embed_dim=text_dim,
             image_embed_dim=image_dim,
             pos_embed_seq_len=pos_embed_seq_len,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "condition_embedder"),
         )
 
         # 3. Transformer blocks
         self.blocks = nn.ModuleList(
             [
-                WanTransformerBlock(inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm)
-                for _ in range(num_layers)
+                WanTransformerBlock(
+                    inner_dim,
+                    ffn_dim,
+                    num_attention_heads,
+                    eps,
+                    added_kv_proj_dim,
+                    cross_attn_norm,
+                    quant_config=quant_config,
+                    prefix=_append_prefix(prefix, f"blocks.{layer_idx}"),
+                )
+                for layer_idx in range(num_layers)
             ]
         )
 
         # 4. Output norm & projection
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
-        self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
+        self.proj_out = ReplicatedLinear(
+            inner_dim,
+            out_channels * math.prod(patch_size),
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_append_prefix(prefix, "proj_out"),
+        )
 
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
@@ -1005,6 +1244,11 @@ class WanTransformer3DModel(nn.Module):
                     lookup_name = lookup_name.replace(".ffn.net.0.", ".ffn.net_0.")
                 elif ".ffn.net.2." in lookup_name:
                     lookup_name = lookup_name.replace(".ffn.net.2.", ".ffn.net_2.")
+
+                if ".ff.net.0." in lookup_name:
+                    lookup_name = lookup_name.replace(".ff.net.0.", ".ff.net_0.")
+                elif ".ff.net.2." in lookup_name:
+                    lookup_name = lookup_name.replace(".ff.net.2.", ".ff.net_2.")
 
                 if ".to_out.0." in lookup_name:
                     lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
